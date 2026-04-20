@@ -1,5 +1,6 @@
 import os
-from typing import List, Union
+import json
+from typing import List, Optional
 from typing_extensions import Annotated
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -7,15 +8,75 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
 from fastapi.middleware.cors import CORSMiddleware
+import psycopg
 
 # Load environment variables
 load_dotenv()
+
+# --- 0. DATABASE SETUP ---
+
+DB_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/langchain-manual")
+# Convert SQLAlchemy-style URL to psycopg-compatible (remove +psycopg suffix if present)
+PSYCOPG_URL = DB_URL.replace("postgresql+psycopg://", "postgresql://")
+
+def init_db():
+    """Create the message_store table if it doesn't exist."""
+    with psycopg.connect(PSYCOPG_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS message_store (
+                    id SERIAL PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW()
+                );
+                CREATE INDEX IF NOT EXISTS idx_message_store_session 
+                    ON message_store(session_id);
+            """)
+            conn.commit()
+
+def save_message(session_id: str, role: str, content: str):
+    """Save a single message to the database."""
+    with psycopg.connect(PSYCOPG_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO message_store (session_id, role, content) VALUES (%s, %s, %s)",
+                (session_id, role, content)
+            )
+            conn.commit()
+
+def get_messages(session_id: str) -> List[dict]:
+    """Retrieve all messages for a session from the database."""
+    with psycopg.connect(PSYCOPG_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT role, content FROM message_store WHERE session_id = %s ORDER BY id ASC",
+                (session_id,)
+            )
+            rows = cur.fetchall()
+            return [{"role": row[0], "content": row[1]} for row in rows]
+
+def convert_to_langchain_messages(messages: List[dict]) -> List[BaseMessage]:
+    """Convert DB messages to LangChain message objects."""
+    lc_messages = []
+    for msg in messages:
+        if msg["role"] == "system":
+            lc_messages.append(SystemMessage(content=msg["content"]))
+        elif msg["role"] == "user":
+            lc_messages.append(HumanMessage(content=msg["content"]))
+        elif msg["role"] == "assistant":
+            lc_messages.append(AIMessage(content=msg["content"]))
+    return lc_messages
+
+# Initialize the DB on startup
+init_db()
+print("[OK] Database connected & message_store table ready!")
 
 # --- 1. TOOLS DEFINITION ---
 
 def get_weather(city: str) -> str:
     """Get current weather for a specific city. Input should be a city name."""
-    # Mock data for demonstration
     weather_data = {
         "mumbai": "32°C, Sunny",
         "bangalore": "24°C, Pleasant",
@@ -26,7 +87,6 @@ def get_weather(city: str) -> str:
 
 def get_balance(user_id: str) -> str:
     """Fetch the account balance for a user. Input should be a numeric user ID (e.g., '123')."""
-    # Mock data for demonstration
     balances = {
         "123": "₹10,500.25",
         "456": "₹2,000.00",
@@ -66,9 +126,8 @@ available_tools = {
     "get_balance": get_balance
 }
 
-# --- 2. AGENT LOGIC (MANUAL LOOP for Python 3.8 Compatibility) ---
+# --- 2. AGENT LOGIC ---
 
-# Initialize LLM with Gemini settings
 llm = ChatOpenAI(
     model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
     openai_api_key=os.getenv("GEMINI_API_KEY"),
@@ -79,7 +138,6 @@ llm = ChatOpenAI(
 async def run_agent_loop(messages: List[BaseMessage]):
     current_messages = list(messages)
     
-    # Maximum 5 iterations to prevent infinite loops
     for _ in range(5):
         response = llm.invoke(current_messages)
         current_messages.append(response)
@@ -87,7 +145,6 @@ async def run_agent_loop(messages: List[BaseMessage]):
         if not response.tool_calls:
             return response.content
         
-        # Handle tool calls
         for tool_call in response.tool_calls:
             tool_name = tool_call["name"]
             tool_args = tool_call["args"]
@@ -95,8 +152,6 @@ async def run_agent_loop(messages: List[BaseMessage]):
             if tool_name in available_tools:
                 tool_func = available_tools[tool_name]
                 tool_result = tool_func(**tool_args)
-                
-                # Add tool message to history
                 current_messages.append(ToolMessage(
                     tool_call_id=tool_call["id"],
                     content=str(tool_result)
@@ -111,9 +166,8 @@ async def run_agent_loop(messages: List[BaseMessage]):
 
 # --- 3. FASTAPI APPLICATION ---
 
-app = FastAPI(title="Gemini LangChain Chatbot (Compatible)")
+app = FastAPI(title="Gemini Chatbot with Persistent Memory")
 
-# CORS for React Frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -124,116 +178,56 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     message: str
-    history: List[dict] = []
+    session_id: str
 
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
     try:
-        # Convert history dicts to LangChain messages
-        messages = []
-        for msg in request.history:
-            if msg["role"] == "user":
-                messages.append(HumanMessage(content=msg["content"]))
-            elif msg["role"] == "assistant":
-                messages.append(AIMessage(content=msg["content"]))
-        
-        # Add current user message
-        messages.append(HumanMessage(content=request.message))
-        
-        # Add system instruction
-        system_msg = SystemMessage(content="You are a helpful AI assistant. Use tools when necessary to provide accurate info.")
-        input_messages = [system_msg] + messages
+        # 1. Get existing history from DB
+        db_messages = get_messages(request.session_id)
 
-        # Run Manual Agent Loop
-        final_content = await run_agent_loop(input_messages)
+        # 2. If new session, save system message first
+        if len(db_messages) == 0:
+            save_message(request.session_id, "system",
+                         "You are a helpful AI assistant with persistent memory. "
+                         "You CAN remember previous messages in this conversation. "
+                         "The messages before the current one are your conversation history - use them to answer follow-up questions. "
+                         "Use tools when necessary to provide accurate info.")
+        
+        # 3. Save user message to DB
+        save_message(request.session_id, "user", request.message)
+
+        # 4. Reload full history (now includes the new user message)
+        db_messages = get_messages(request.session_id)
+
+        # 5. Convert to LangChain message objects
+        lc_messages = convert_to_langchain_messages(db_messages)
+
+        # 6. Run Agent Loop
+        final_content = await run_agent_loop(lc_messages)
+        
+        # 7. Save assistant response to DB
+        save_message(request.session_id, "assistant", final_content)
         
         return {"response": final_content}
     
     except Exception as e:
         print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/history/{session_id}")
+async def get_history(session_id: str):
+    """Fetch chat history for a session (excludes system messages from UI)."""
+    try:
+        db_messages = get_messages(session_id)
+        # Filter out system messages for the frontend
+        ui_messages = [m for m in db_messages if m["role"] != "system"]
+        return {"history": ui_messages}
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
-
-
-# @app.post("/chat")
-# async def chat_endpoint(request: ChatRequest):
-
-#     # STEP A: Receive JSON from frontend
-#     # {role, content}
-
-#     messages = []
-
-#     # STEP B: Convert JSON → LangChain objects
-#     for msg in request.history:
-#         if msg["role"] == "user":
-#             messages.append(HumanMessage(content=msg["content"]))
-#         elif msg["role"] == "assistant":
-#             messages.append(AIMessage(content=msg["content"]))
-    
-#     # STEP C: Add latest user message
-#     messages.append(HumanMessage(content=request.message))
-    
-#     # STEP D: Add system message
-#     system_msg = SystemMessage(content="You are a helpful AI assistant...")
-#     input_messages = [system_msg] + messages
-
-#     # STEP E: Run agent loop (main brain)
-#     final_content = await run_agent_loop(input_messages)
-    
-#     # STEP F: Return response → frontend (object → JSON)
-#     return {"response": final_content}
-
-
-
-# # --- 2. AGENT LOGIC (MANUAL LOOP for Python 3.8 Compatibility) ---
-
-# async def run_agent_loop(messages: List[BaseMessage]):
-
-#     # STEP 1: Initial messages received (objects: SystemMessage, HumanMessage)
-#     current_messages = list(messages)
-    
-#     # Maximum 5 iterations to prevent infinite loops
-#     for _ in range(5):
-
-#         # STEP 2: Send messages to LLM (LangChain converts objects → JSON internally)
-#         response = llm.invoke(current_messages)
-
-#         # STEP 3: LLM response (JSON → converted back to AIMessage object)
-#         current_messages.append(response)
-        
-#         # STEP 4: Check → does LLM want to call a tool?
-#         if not response.tool_calls:
-#             # STEP 9: No tool → FINAL ANSWER → exit loop
-#             return response.content
-        
-#         # STEP 5: LLM requested tool execution
-#         for tool_call in response.tool_calls:
-
-#             tool_name = tool_call["name"]
-#             tool_args = tool_call["args"]
-            
-#             # STEP 6: Backend finds and executes tool
-#             if tool_name in available_tools:
-#                 tool_func = available_tools[tool_name]
-#                 tool_result = tool_func(**tool_args)
-                
-#                 # STEP 7: Add ToolMessage (tool result) to messages
-#                 current_messages.append(ToolMessage(
-#                     tool_call_id=tool_call["id"],
-#                     content=str(tool_result)
-#                 ))
-#             else:
-#                 current_messages.append(ToolMessage(
-#                     tool_call_id=tool_call["id"],
-#                     content=f"Tool {tool_name} not found."
-#                 ))
-
-#         # STEP 8: Loop continues → updated messages sent again to LLM
-
-#     # Safety fallback
-#     return current_messages[-1].content

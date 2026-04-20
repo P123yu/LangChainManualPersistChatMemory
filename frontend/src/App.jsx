@@ -5,19 +5,42 @@ import { motion, AnimatePresence } from 'framer-motion';
 
 const API_BASE = "http://localhost:8000";
 
+// Simple Session ID generator
+const generateSessionId = () => `session_${Math.random().toString(36).substr(2, 9)}`;
+
 function App() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [sessionId, setSessionId] = useState(() => {
+    return localStorage.getItem('gemini_session_id') || generateSessionId();
+  });
   const messagesEndRef = useRef(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   };
 
+  // 1. Initial Load: Restore Session & History
+  useEffect(() => {
+    localStorage.setItem('gemini_session_id', sessionId);
+    fetchHistory();
+  }, [sessionId]);
+
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
+  const fetchHistory = async () => {
+    try {
+      const response = await axios.get(`${API_BASE}/history/${sessionId}`);
+      if (response.data.history) {
+        setMessages(response.data.history);
+      }
+    } catch (error) {
+      console.error("Error fetching history:", error);
+    }
+  };
 
   const handleSend = async (e) => {
     e.preventDefault();
@@ -29,10 +52,10 @@ function App() {
     setLoading(true);
 
     try {
-      // Send message to FastAPI backend
+      // Send message with session_id
       const response = await axios.post(`${API_BASE}/chat`, {
         message: input,
-        history: messages
+        session_id: sessionId
       });
 
       const assistantMessage = { role: "assistant", content: response.data.response };
@@ -48,7 +71,9 @@ function App() {
     }
   };
 
-  const clearChat = () => {
+  const startNewChat = () => {
+    const newId = generateSessionId();
+    setSessionId(newId);
     setMessages([]);
   };
 
@@ -64,7 +89,7 @@ function App() {
         </div>
 
         <button 
-          onClick={clearChat}
+          onClick={startNewChat}
           style={{
             display: 'flex',
             alignItems: 'center',
@@ -76,7 +101,8 @@ function App() {
             color: 'white',
             cursor: 'pointer',
             marginBottom: '1.5rem',
-            transition: 'all 0.3s'
+            transition: 'all 0.3s',
+            width: '100%'
           }}
         >
           <Plus size={18} />
@@ -85,11 +111,12 @@ function App() {
 
         <div style={{ flex: 1, overflowY: 'auto' }}>
           <p style={{ color: 'var(--text-muted)', fontSize: '0.875rem', marginBottom: '1rem', padding: '0 0.5rem' }}>RECENT CHATS</p>
-          {/* Mock history links */}
           <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
             <div style={{ padding: '0.75rem 1rem', background: 'rgba(99, 102, 241, 0.1)', borderRadius: '0.5rem', borderLeft: '3px solid var(--primary)', display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
               <MessageSquare size={16} />
-              <span style={{ fontSize: '0.9rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>Current Session</span>
+              <span style={{ fontSize: '0.9rem', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                {sessionId.replace('session_', 'ID: ')}
+              </span>
             </div>
           </div>
         </div>
@@ -100,7 +127,7 @@ function App() {
           </div>
           <div>
             <p style={{ fontSize: '0.875rem', fontWeight: 600 }}>Guest User</p>
-            <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Free Plan</p>
+            <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Persistent DB Connected</p>
           </div>
         </div>
       </aside>
@@ -114,10 +141,10 @@ function App() {
             </div>
             <div>
               <h3 style={{ fontSize: '1.1rem', fontWeight: 600 }}>Gemini-2.5-Flash</h3>
-              <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Powered by Google AI & LangGraph</p>
+              <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>Powered by PostgreSQL Persistence</p>
             </div>
           </div>
-          <button onClick={clearChat} style={{ color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer' }} title="Clear Chat">
+          <button onClick={startNewChat} style={{ color: 'var(--text-muted)', background: 'none', border: 'none', cursor: 'pointer' }} title="Start New Chat">
             <Trash2 size={20} />
           </button>
         </header>
@@ -129,18 +156,8 @@ function App() {
                 <Bot size={40} color="var(--primary)" />
               </div>
               <div>
-                <h2 style={{ fontSize: '2rem', marginBottom: '0.5rem' }}>How can I help you today?</h2>
-                <p style={{ color: 'var(--text-muted)', maxWidth: '400px' }}>Ask me about the weather, check your balance, or just have a chat. I'm powered by advanced reasoning agents.</p>
-              </div>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', width: '100%', maxWidth: '500px' }}>
-                <div onClick={() => setInput("What is the weather in Mumbai?")} style={{ padding: '1rem', background: 'var(--bg-card)', border: '1px solid var(--glass-border)', borderRadius: '0.75rem', cursor: 'pointer', textAlign: 'left', transition: 'all 0.2s' }} className="hover-card">
-                  <p style={{ fontSize: '0.9rem', fontWeight: 500 }}>🌦️ Check weather</p>
-                  <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>"What is the weather in Mumbai?"</p>
-                </div>
-                <div onClick={() => setInput("What is my account balance? (User 123)")} style={{ padding: '1rem', background: 'var(--bg-card)', border: '1px solid var(--glass-border)', borderRadius: '0.75rem', cursor: 'pointer', textAlign: 'left', transition: 'all 0.2s' }} className="hover-card">
-                  <p style={{ fontSize: '0.9rem', fontWeight: 500 }}>💰 Check balance</p>
-                  <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>"What is my balance? User 123"</p>
-                </div>
+                <h2 style={{ fontSize: '2rem', marginBottom: '0.5rem' }}>Session Restored</h2>
+                <p style={{ color: 'var(--text-muted)', maxWidth: '400px' }}>Your history is safe in the database. Ask me anything to continue.</p>
               </div>
             </div>
           )}
@@ -176,7 +193,7 @@ function App() {
             <input 
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder="Message Gemini AI..."
+              placeholder="Message persistent Gemini AI..."
               autoFocus
             />
             <button type="submit" className="send-btn" disabled={!input.trim() || loading}>
@@ -184,7 +201,7 @@ function App() {
             </button>
           </form>
           <p style={{ textAlign: 'center', fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '1rem' }}>
-            Gemini AI uses LangGraph and Tools. Be careful with balance queries.
+            History is being persisted to the 'langchain-manual' database.
           </p>
         </div>
       </main>

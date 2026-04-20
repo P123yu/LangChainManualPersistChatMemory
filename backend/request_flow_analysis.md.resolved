@@ -1,0 +1,71 @@
+# Interaction Flow Analysis: Gemini Chatbot
+
+This document details the step-by-step journey of a prompt from the moment a user clicks "send" to the final response.
+
+## Detailed Flowchart
+
+```mermaid
+sequenceDiagram
+    participant U as User (Browser)
+    participant F as React Frontend (App.jsx)
+    participant B as FastAPI Backend (main.py)
+    participant L as Gemini LLM (Google AI)
+    participant T as Tools (get_weather/get_balance)
+
+    U->>F: Clicks Send / Presses Enter
+    F->>F: handleSend(e)
+    Note over F: Update local 'messages' state (User message)
+    F->>B: POST /chat { message, history }
+    
+    B->>B: chat_endpoint(request)
+    Note over B: Convert history to LangChain messages
+    B->>B: run_agent_loop(input_messages)
+    
+    loop Agent Reasoning (Max 5 iterations)
+        B->>L: llm.invoke(current_messages)
+        L-->>B: AI response (content or tool_calls)
+        
+        alt Tool Calls Detected
+            Note over B: Iterate tool_calls
+            B->>T: Call tool function (e.g., get_weather)
+            T-->>B: Return tool result
+            Note over B: Append ToolMessage to history
+        else No Tool Calls
+            Note over B: Exit loop
+        end
+    end
+    
+    B-->>F: JSON { response: final_content }
+    F->>F: Update 'messages' state (Assistant message)
+    F-->>U: Render response in UI
+```
+
+## Method-by-Method Breakdown
+
+### 1. Frontend: Triggering the Request
+- **Location**: [`App.jsx`](file:///c:/Users/piyush_kumar/.gemini/antigravity/scratch/langchain-gemini-bot/frontend/src/App.jsx)
+- **Method**: `handleSend(e)`
+  - **Action**: Prevents default form submission, adds the user's message to the `messages` state, sets `loading` to true, and clears the input field.
+  - **Network Call**: Uses `axios.post` to send the payload to the backend.
+
+### 2. Backend: Receiving the Call
+- **Location**: [`main.py`](file:///c:/Users/piyush_kumar/.gemini/antigravity/scratch/langchain-gemini-bot/backend/main.py)
+- **Method**: `chat_endpoint(request: ChatRequest)`
+  - **Action**: Converts the generic history dictionaries from the frontend into LangChain's `HumanMessage` and `AIMessage` objects.
+  - **System Prompt**: Prepends a `SystemMessage` to set the AI's behavior.
+
+### 3. Backend: The Reasoning Loop
+- **Location**: [`main.py`](file:///c:/Users/piyush_kumar/.gemini/antigravity/scratch/langchain-gemini-bot/backend/main.py)
+- **Method**: `run_agent_loop(messages)`
+  - **Logic**: This replaces the `langgraph` workflow for Python 3.8 compatibility.
+  - **Iteration**:
+    1. **`llm.invoke(current_messages)`**: Sends the entire conversation history to Gemini.
+    2. **Tool Check**: Inspects `response.tool_calls`.
+    3. **Tool Execution**: If tools are requested, it looks up the function in the `available_tools` map and executes it (e.g., `get_weather`).
+    4. **History Update**: Appends a `ToolMessage` with the result back to the conversation and loops to let the model "read" the tool result and formulate a final answer.
+
+### 4. Frontend: Completing the Cycle
+- **Location**: [`App.jsx`](file:///c:/Users/piyush_kumar/.gemini/antigravity/scratch/langchain-gemini-bot/frontend/src/App.jsx)
+- **Method**: `handleSend` (callback)
+  - **Action**: Receives the JSON response, adds the assistant's message to the state, and sets `loading` to false.
+  - **UI**: The `AnimatePresence` and `motion.div` components automatically animate the new message into view.

@@ -5,3 +5,6 @@ uvicorn
 python-dotenv
 pydantic
 typing-extensions
+psycopg[binary]
+sqlalchemy
+langchain-community
